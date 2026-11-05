@@ -19,28 +19,55 @@ async function sign(s3, bucket, path, method) {
   return signed.url;
 }
 
+function unauthorized(message) {
+  return new Response(JSON.stringify({ message }), {
+    status: 401,
+    headers: {
+      "Content-Type": MIME,
+      "LFS-Authenticate": 'Basic realm="git-lfs"',
+      "WWW-Authenticate": 'Basic realm="git-lfs"',
+    },
+  });
+}
+
 function parseAuthorization(req) {
   const auth = req.headers.get("Authorization");
   if (!auth) {
-    throw new Response(null, { status: 401 });
+    throw unauthorized("Credentials needed: an S3 access key ID and secret");
   }
 
   const [scheme, encoded] = auth.split(" ");
   if (scheme !== "Basic" || !encoded) {
-    throw new Response(null, { status: 400 });
+    throw unauthorized("Use Basic auth: an S3 access key ID and secret");
   }
 
-  const buffer = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
-  const decoded = new TextDecoder().decode(buffer);
+  let decoded;
+  try {
+    const buffer = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+    decoded = new TextDecoder().decode(buffer);
+  } catch {
+    throw unauthorized("Malformed Basic auth");
+  }
+
   const index = decoded.indexOf(":");
   if (index === -1) {
-    throw new Response(null, { status: 400 });
+    throw unauthorized("Malformed Basic auth");
   }
 
   return { user: decoded.slice(0, index), pass: decoded.slice(index + 1) };
 }
 
-async function fetch(req, env) {
+// Signing needs no network, so a bad key would only fail later, on the signed URLs, where git-lfs retries a 401
+// forever. One HEAD on the bucket refuses it here instead. Only a clear refusal counts: any other answer carries on, and
+// a real outage shows up on the transfers. If the store can't be reached at all, the fetch throws and the request fails
+// with a 500, which git-lfs doesn't treat as a bad key. Nothing from the store's response is passed on.
+async function keyRefused(s3, bucket) {
+  const signed = await s3.sign(new Request(`https://${bucket}`, { method: "HEAD" }));
+  const { status } = await globalThis.fetch(signed);
+  return status === 400 || status === 401 || status === 403;
+}
+
+async function handle(req, env) {
   const url = new URL(req.url);
 
   if (url.pathname == "/") {
@@ -88,7 +115,16 @@ async function fetch(req, env) {
   const bucket = segments.slice(bucketIdx).join("/");
   const expires_in = params.expiry || env.EXPIRY || EXPIRY;
 
-  const { objects, operation, hash_algo = "sha256" } = await req.json();
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return new Response(JSON.stringify({ message: "Malformed JSON" }), {
+      status: 400,
+      headers: { "Content-Type": MIME },
+    });
+  }
+  const { objects, operation, hash_algo = "sha256" } = body;
 
   if (hash_algo !== "sha256") {
     return new Response(
@@ -100,6 +136,10 @@ async function fetch(req, env) {
         headers: { "Content-Type": "application/vnd.git-lfs+json" },
       },
     );
+  }
+
+  if (await keyRefused(s3, bucket)) {
+    return unauthorized("The object store refused this access key");
   }
 
   const method = METHOD_FOR[operation];
@@ -130,4 +170,15 @@ async function fetch(req, env) {
   });
 }
 
-export default { fetch };
+export default {
+  async fetch(req, env) {
+    try {
+      return await handle(req, env);
+    } catch (e) {
+      if (e instanceof Response) {
+        return e;
+      }
+      throw e;
+    }
+  },
+};
