@@ -58,8 +58,9 @@ function parseAuthorization(req) {
 }
 
 // Signing needs no network, so a bad key would only fail later, on the signed URLs, where git-lfs retries a 401
-// forever. One HEAD on the bucket refuses it here instead. Only a clear refusal counts: anything else carries on, and
-// a real outage shows up on the transfers. Nothing from the store's response is passed on.
+// forever. One HEAD on the bucket refuses it here instead. Only a clear refusal counts: any other answer carries on, and
+// a real outage shows up on the transfers. If the store can't be reached at all, the fetch throws and the request fails
+// with a 500, which git-lfs doesn't treat as a bad key. Nothing from the store's response is passed on.
 async function keyRefused(s3, bucket) {
   const signed = await s3.sign(new Request(`https://${bucket}`, { method: "HEAD" }));
   const { status } = await globalThis.fetch(signed);

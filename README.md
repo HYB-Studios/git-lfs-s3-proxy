@@ -155,6 +155,15 @@ You're now ready to [start using Git LFS](https://github.com/git-lfs/git-lfs#exa
 
 # Quirks
 
+### Wrong or revoked keys
+
+S3 keys are only checked when a presigned URL is used, and git-lfs retries a `401` from a presigned URL at once and forever: no error, no progress and no exit. To stop that, the proxy tests the key with one `HEAD` on the bucket per batch request. If the store refuses the key (`400`, `401` or `403`), the proxy answers the batch request with `401`. git-lfs then fails within about a second, and tells Git to forget the stored credential. The next attempt reports `Git credentials ... not found`.
+
+- Each batch request now makes one more request to your store. On R2 a `HEAD` is a Class B operation.
+- The key must be allowed to `HEAD` the bucket. A key limited to single objects is refused, even if it could read them.
+- A `5xx` or any other answer to the `HEAD` doesn't count as a refusal, so the request carries on to the presigned URLs. If the store answers `5xx` here and also refuses the presigned URLs, git-lfs can still hang. Run it under a time limit in unattended jobs.
+- A missing key also gets a `401` now, rather than an uncaught exception's `500`, so git-lfs can ask for credentials without `lfs.<url>.access = basic`.
+
 ### GitLab: Disable built-in LFS
 
 GitLab "helpfully" rejects commits containing "missing" LFS objects. After configuring a non-GitLab LFS server, GitLab will consider all new LFS objects "missing" and reject new commits:
